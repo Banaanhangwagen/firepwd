@@ -37,6 +37,16 @@ from pyasn1.codec.der import decoder as der_decoder
 # It's a hardcoded ID used by Firefox to identify the main private key.
 CKA_ID = b'\xf8\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01'
 
+# PKCS#11 key types (CKA_KEY_TYPE / column a100 in nssPrivate). After a 3DES->AES
+# profile migration (Firefox 141+), both a CKK_DES3 and a CKK_AES key can live
+# under the same CKA_ID; the login's algorithm OID decides which one to use.
+CKK_DES3 = 0x15
+CKK_AES = 0x1f
+
+# Login encryption algorithm OIDs (inside each logins.json entry).
+OID_DES3_CBC = '1.2.840.113549.3.7'
+OID_AES_CBC = '2.16.840.1.101.3.4.1.42'
+
 
 def decrypt_moz_3des(global_salt: bytes, master_password: bytes, entry_salt: bytes, encrypted_data: bytes) -> bytes:
     """
@@ -141,7 +151,7 @@ def decrypt_pbe(decoded_item: tuple, master_password: bytes, global_salt: bytes)
         raise Exception(f"Unknown PBE algorithm: {pbe_algo_oid}")
 
 
-def get_master_key(db_path: Path, master_password: str) -> bytes:
+def get_master_keys(db_path: Path, master_password: str) -> dict:
 
     master_password_bytes = master_password.encode('utf-8')
 
@@ -181,28 +191,45 @@ def get_master_key(db_path: Path, master_password: str) -> bytes:
         # The key is in the 'nssPrivate' table, identified by CKA_ID
         print(f"[INFO] - Reading key4-db: obtaining master_key")
 
-        c.execute("SELECT a11, a102 FROM nssPrivate;")
-        master_key_data = None
-        for row in c:
-            if row[1] == CKA_ID:  # a102 is CKA_ID
-                master_key_data = row[0]  # a11 is encrypted master_key
-                break
+        # The default CKA_ID can map to MORE THAN ONE key: after a profile is
+        # migrated from 3DES to AES (Firefox 141+), NSS keeps the legacy
+        # CKK_DES3 key AND creates a new CKK_AES key under the same CKA_ID.
+        # NSS picks the key whose type matches the cipher (PK11_FindFixedKey),
+        # so grabbing the first CKA_ID match may return the wrong one. Collect
+        # every candidate, keyed by CKA_KEY_TYPE.
+        columns = [r[1] for r in c.execute("PRAGMA table_info(nssPrivate)")]
+        has_key_type = 'a100' in columns  # a100 = CKA_KEY_TYPE
+        select = "a11, a102" + (", a100" if has_key_type else "")
 
-        if not master_key_data:
+        master_keys = {}
+        for row in c.execute(f"SELECT {select} FROM nssPrivate;"):
+            if row[1] != CKA_ID:  # a102 = CKA_ID
+                continue
+
+            # The decrypted value still carries PKCS#7 padding. Strip it:
+            # PBES2/AES pads to a 16-byte block, legacy 3DES to 8. NSS uses the
+            # unpadded key verbatim, so its length must be exact.
+            padded_key, algo = decrypt_pbe(
+                der_decoder.decode(row[0]), master_password_bytes, global_salt)
+            block_size = AES.block_size if algo == '1.2.840.113549.1.5.13' else DES3.block_size
+            key = unpad(padded_key, block_size)
+
+            # Prefer the stored CKA_KEY_TYPE; otherwise infer from key length
+            # (32 bytes -> AES-256, anything else -> treat as 3DES/legacy).
+            if has_key_type and row[2] is not None:
+                key_type = int.from_bytes(row[2], 'big')
+            else:
+                key_type = CKK_AES if len(key) == 32 else CKK_DES3
+            master_keys[key_type] = key
+
+        if not master_keys:
             raise Exception("Could not find master key in nssPrivate table.")
 
-        # Decode and decrypt the master key
-        decoded_key = der_decoder.decode(master_key_data)
-        # print(f"Raw encrypted master_key:\t\t\t\t\t", master_key_data.hex())
-        # print(f"Decoded master_key:\t\t\t\t\t\t\t", decoded_key)
+        for kt, k in master_keys.items():
+            name = {CKK_DES3: '3DES', CKK_AES: 'AES'}.get(kt, hex(kt))
+            print(f"\t[!] Decrypted master_key [{name}, {len(k)} bytes] : {k.hex()}")
 
-        # The decrypted result *is* the 24-byte 3DES key used for logins
-        final_key, algo = decrypt_pbe(decoded_key, master_password_bytes, global_salt)
-
-        # print(f"Mentioned algo ID:\t\t\t\t\t\t\t {algo}")
-        print(f"\t[!] Decrypted master_key :", final_key.hex())
-
-        return final_key
+        return master_keys
 
 
 def get_logins(logins_path: Path) -> list:
@@ -232,7 +259,7 @@ def get_logins(logins_path: Path) -> list:
     return logins
 
 
-def decrypt_login(login_data_bytes: bytes, key: bytes) -> str:
+def decrypt_login(login_data_bytes: bytes, master_keys: dict) -> str:
     """
 oidValues = {b'2a864886f70d010c050103': '1.2.840.113549.1.12.5.1.3 pbeWithSha1AndTripleDES-CBC',
              b'2a864886f70d0307': '1.2.840.113549.3.7 des-ede3-cbc',
@@ -257,17 +284,22 @@ oidValues = {b'2a864886f70d010c050103': '1.2.840.113549.1.12.5.1.3 pbeWithSha1An
     # print(f"    [Debug] IV:         {iv.hex()}")
     # print(f"    [Debug] Ciphertext: {ciphertext.hex()}")
 
-    # 3. Decrypt
-    if algo_oid == '1.2.840.113549.3.7' : # or algo_oid == '1.2.840.113549.1.12.5.1.3' or algo_oid == '1.2.840.113549.1.5.13':  # 3DES-CBC
-        # Use first 24 bytes of master key
-        decryption_key = key[:24]
-        cipher = DES3.new(decryption_key, DES3.MODE_CBC, iv)
+    # 3. Decrypt, selecting the master key whose type matches the cipher
+    #    (NSS keys SDR blobs by keyid AND mechanism, not keyid alone).
+    if algo_oid == OID_DES3_CBC:  # 3DES-CBC
+        key = master_keys.get(CKK_DES3)
+        if key is None:
+            raise Exception("No CKK_DES3 master key found for a 3DES login")
+        cipher = DES3.new(key[:24], DES3.MODE_CBC, iv)
         decrypted_bytes = unpad(cipher.decrypt(ciphertext), DES3.block_size)
 
-    elif algo_oid == '2.16.840.1.101.3.4.1.42':  # AES256-CBC
-        # Use first 32 bytes of master key
-        decryption_key = key[:32]
-        cipher = AES.new(decryption_key, AES.MODE_CBC, iv)
+    elif algo_oid == OID_AES_CBC:  # AES-CBC (NSS SDR, Firefox 141+)
+        # Prefer the dedicated AES key; fall back to a legacy key reused as
+        # AES (its length selects AES-192 vs AES-256).
+        key = master_keys.get(CKK_AES) or master_keys.get(CKK_DES3)
+        if key is None:
+            raise Exception("No AES master key found for an AES login")
+        cipher = AES.new(key, AES.MODE_CBC, iv)
         decrypted_bytes = unpad(cipher.decrypt(ciphertext), AES.block_size)
     else:
         raise Exception(f"Unknown login encryption algorithm: {algo_oid}")
@@ -302,9 +334,9 @@ def main():
         print(f"Error: 'logins.json' not found in '{profile_dir}'")
         sys.exit(1)
 
-    # --- 2. Get the Master Key ---
+    # --- 2. Get the Master Key(s) ---
     try:
-        master_key = get_master_key(key_db_path, args.master_password)
+        master_keys = get_master_keys(key_db_path, args.master_password)
     except Exception as e:
         print(f"Error: {e}")
         sys.exit(1)
@@ -320,8 +352,8 @@ def main():
     # --- 4. Decrypt and Print ---
     for entry in logins:
         try:
-            username = decrypt_login(entry['username_data'], master_key)
-            password = decrypt_login(entry['password_data'], master_key)
+            username = decrypt_login(entry['username_data'], master_keys)
+            password = decrypt_login(entry['password_data'], master_keys)
 
             print(f"\n  URL: {entry['hostname']}")
             print(f"  User: {username}")
